@@ -41,7 +41,7 @@ REGISTRY_ROUTES = {
 
 # Default upstream for Docker Hub
 HUB_HOST = 'registry-1.docker.io'
-AUTH_URL='https://auth.docker.io'
+AUTH_URL = 'https://auth.docker.io'
 
 # Token cache: (auth_url, repo) -> { token, expires }
 _token_cache = {}
@@ -80,12 +80,6 @@ Commercial support is available at
 <p><em>Thank you for using nginx.</em></p>
 </body>
 </html>"""
-
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Don't follow redirects - return them to the client."""
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 def get_token(repo, auth_url=AUTH_URL, service='registry.docker.io'):
@@ -196,8 +190,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Check if browser request
         is_browser = 'mozilla' in user_agent.lower()
 
+        # /health - diagnose upstream connectivity
+        if path == '/health':
+            self._handle_health()
+            return
+
         # /v2/ ping - registry 2.0 handshake
-        if path == '/v2/':
+        if path in ('/v2/', '/v2'):
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Docker-Distribution-API-Version', 'registry/2.0')
@@ -284,17 +283,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if token:
                 fwd_headers['Authorization'] = f'Bearer {token}'
 
+        # Forward AWS S3 signature header (needed for some blob downloads)
+        if self.headers.get('X-Amz-Content-Sha256'):
+            fwd_headers['X-Amz-Content-Sha256'] = self.headers.get('X-Amz-Content-Sha256')
+
         try:
             req = urllib.request.Request(upstream_url, headers=fwd_headers)
-            opener = urllib.request.build_opener(NoRedirectHandler())
-            with opener.open(req, timeout=30) as resp:
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                # Follow CDN redirects for blob downloads (server-side)
+                if resp.status in (301, 302, 307, 308) and resp.headers.get('Location'):
+                    self._follow_cdn(resp.headers['Location'])
+                    return
+
                 body = resp.read()
                 resp_headers = dict(resp.getheaders())
-
-                if resp.status in (301, 302, 307, 308) and 'location' in resp_headers:
-                    resp_headers['location'] = self._rewrite_location(
-                        resp_headers['location'], hub_host
-                    )
 
                 if 'Www-Authenticate' in resp_headers:
                     resp_headers['Www-Authenticate'] = self._rewrite_auth(
@@ -318,10 +321,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             body = e.read()
             resp_headers = dict(e.headers)
 
-            if e.code in (301, 302, 307, 308) and 'location' in resp_headers:
-                resp_headers['location'] = self._rewrite_location(
-                    resp_headers['location'], hub_host
-                )
+            # Follow CDN redirects for blob downloads
+            if e.code in (301, 302, 307, 308) and resp_headers.get('Location'):
+                self._follow_cdn(resp_headers['Location'])
+                return
 
             if 'Www-Authenticate' in resp_headers:
                 resp_headers['Www-Authenticate'] = self._rewrite_auth(
@@ -443,13 +446,78 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             print(f'[ERROR] {self.command} {self.path}: {e}')
             self._respond_json(502, {'error': 'proxy_error', 'message': str(e)})
 
-    def _rewrite_location(self, location, hub_host):
-        """Rewrite redirect Location header."""
-        if hub_host in location:
-            location = location.replace(f'https://{hub_host}', '')
-        if 'registry-1.docker.io' in location:
-            location = location.replace('https://registry-1.docker.io', '')
-        return location
+    def _handle_health(self):
+        """Diagnose connectivity to upstream services."""
+        checks = [
+            ('auth.docker.io', f'{AUTH_URL}/token?service=registry.docker.io&scope=repository:library/alpine:pull'),
+            ('registry-1.docker.io', f'https://{HUB_HOST}/v2/'),
+            ('hub.docker.com', 'https://hub.docker.com/'),
+        ]
+        results = []
+        for name, url in checks:
+            start = time.time()
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'docker-proxy/health'})
+                ctx = ssl.create_default_context()
+                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                    elapsed = int((time.time() - start) * 1000)
+                    ok = resp.status in (200, 401)  # 401 is expected for registry without auth
+                    results.append({
+                        'name': name, 'status': f'HTTP {resp.status}',
+                        'latency': f'{elapsed}ms', 'detail': 'OK' if ok else f'HTTP {resp.status}'
+                    })
+            except urllib.error.HTTPError as e:
+                elapsed = int((time.time() - start) * 1000)
+                ok = e.code in (200, 401)  # 401 is expected for registry without auth
+                results.append({
+                    'name': name, 'status': f'HTTP {e.code}',
+                    'latency': f'{elapsed}ms', 'detail': 'OK' if ok else f'HTTP {e.code}'
+                })
+            except Exception as e:
+                elapsed = int((time.time() - start) * 1000)
+                results.append({
+                    'name': name, 'status': 'FAIL',
+                    'latency': f'{elapsed}ms', 'detail': str(e)
+                })
+        self._respond_json(200, {
+            'proxy': 'running',
+            'time': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            'listen': f':{PORT}',
+            'checks': results,
+        })
+
+    def _follow_cdn(self, location):
+        """Follow CDN redirect for blob downloads, stream result to client."""
+        # Remove Authorization header for CDN requests
+        fwd_headers = {
+            'User-Agent': self.headers.get('User-Agent', 'docker-proxy/1.0'),
+            'Accept': self.headers.get('Accept', '*/*'),
+        }
+        try:
+            req = urllib.request.Request(location, headers=fwd_headers)
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
+                resp_headers = dict(resp.getheaders())
+                resp_headers['Access-Control-Allow-Origin'] = '*'
+                resp_headers['Access-Control-Expose-Headers'] = '*'
+                resp_headers['Cache-Control'] = 'max-age=31536000'
+                for h in ['Content-Security-Policy', 'Content-Security-Policy-Report-Only', 'Clear-Site-Data']:
+                    resp_headers.pop(h, None)
+                self.send_response(resp.status)
+                for k, v in resp_headers.items():
+                    if k.lower() not in ('connection', 'transfer-encoding'):
+                        self.send_header(k, v)
+                self.end_headers()
+                # Stream body in chunks
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except Exception as e:
+            print(f'[ERROR] CDN follow failed: {location} -> {e}')
+            self._respond_json(502, {'error': 'cdn_error', 'message': str(e)})
 
     def _rewrite_auth(self, auth):
         """Rewrite Www-Authenticate header to point to this proxy."""
