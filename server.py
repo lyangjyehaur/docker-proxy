@@ -180,12 +180,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _proxy_transparent(self, path, query):
         """Transparent proxy to hub.docker.com for browser access."""
-        upstream_url = f'https://hub.docker.com{path}'
+        # /v1/* paths go to index.docker.io (search API)
+        if path.startswith('/v1/'):
+            upstream_host = 'index.docker.io'
+        else:
+            upstream_host = 'hub.docker.com'
+
+        upstream_url = f'https://{upstream_host}{path}'
         if query:
             upstream_url += f'?{query}'
 
         fwd_headers = {
-            'Host': 'hub.docker.com',
+            'Host': upstream_host,
             'User-Agent': self.headers.get('User-Agent', 'docker-proxy/1.0'),
             'Accept': self.headers.get('Accept', '*/*'),
             'Accept-Language': self.headers.get('Accept-Language', ''),
@@ -196,6 +202,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Forward cookies for logged-in sessions
         if self.headers.get('Cookie'):
             fwd_headers['Cookie'] = self.headers.get('Cookie')
+
+        # Forward Authorization header for authenticated requests
+        if self.headers.get('Authorization'):
+            fwd_headers['Authorization'] = self.headers.get('Authorization')
 
         try:
             req = urllib.request.Request(upstream_url, headers=fwd_headers)
@@ -208,6 +218,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if 'Location' in resp_headers:
                     resp_headers['Location'] = resp_headers['Location'].replace(
                         'https://hub.docker.com', ''
+                    ).replace(
+                        'https://index.docker.io', ''
                     )
 
                 # Remove security headers that block embedding
