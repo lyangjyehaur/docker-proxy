@@ -34,6 +34,10 @@ if _extra_uas:
 # Dashboard auth token (set via env to protect dashboard/API)
 DASHBOARD_TOKEN = os.environ.get('DASHBOARD_TOKEN', '')
 
+# Proxy auth token (set via env to require docker login for pulling images)
+# Users run: docker login docker.dan.tw (any username, password = PROXY_TOKEN)
+PROXY_TOKEN = os.environ.get('PROXY_TOKEN', '')
+
 # Registry routing table
 REGISTRY_ROUTES = {
     'quay':      'quay.io',
@@ -741,8 +745,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             stats_increment('success_count')
             return
 
-        # /v2/ ping - registry 2.0 handshake
+        # /v2/ ping - registry 2.0 handshake (check proxy auth)
         if path in ('/v2/', '/v2'):
+            if not self._check_proxy_auth():
+                return
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Docker-Distribution-API-Version', 'registry/2.0')
@@ -758,8 +764,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._proxy_transparent(path, qs, 'hub.docker.com')
             return
 
-        # /v2/* registry API
+        # /v2/* registry API (check proxy auth)
         if path.startswith('/v2/'):
+            if not self._check_proxy_auth():
+                return
             upstream_path = path
             if is_docker_hub and is_official_image(path):
                 upstream_path = path.replace('/v2/', '/v2/library/', 1)
@@ -1112,6 +1120,37 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         auth = auth.replace('https://quay.io/v2/auth', f'http://{host}/token')
         return auth
 
+    def _check_proxy_auth(self):
+        """Check proxy-level auth for pulling images. Returns True if allowed."""
+        if not PROXY_TOKEN:
+            return True
+
+        # Check Basic Auth header (docker login sends this)
+        auth_header = self.headers.get('Authorization', '')
+        if auth_header.startswith('Basic '):
+            import base64
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode()
+                _, password = decoded.split(':', 1)
+                if password == PROXY_TOKEN:
+                    return True
+            except Exception:
+                pass
+
+        # Auth required - return 401 with Www-Authenticate
+        self.send_response(401)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Www-Authenticate', f'Basic realm="Docker Proxy",service="docker.dan.tw"')
+        self.send_header('Docker-Distribution-API-Version', 'registry/2.0')
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            'errors': [{'code': 'UNAUTHORIZED', 'message': 'authentication required'}]
+        }).encode())
+        stats_increment('error_count')
+        return False
+
     def _check_dashboard_auth(self):
         """Check dashboard auth via cookie or query param. Returns True if allowed."""
         # If no token configured, allow all access
@@ -1155,5 +1194,6 @@ if __name__ == '__main__':
     server = http.server.HTTPServer(('0.0.0.0', PORT), ProxyHandler)
     print(f'Docker proxy listening on :{PORT} (mode={MODE}, blocked_uas={len(BLOCKED_UAS)})')
     print(f'Accounts file: {ACCOUNTS_FILE}')
+    print(f'Proxy auth: {"enabled" if PROXY_TOKEN else "disabled (public)"}')
     print(f'Dashboard: http://localhost:{PORT}/dashboard')
     server.serve_forever()
