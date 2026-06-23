@@ -1,13 +1,29 @@
 # docker-proxy
 
-轻量 Docker Hub 代理服务，纯 Python 实现，零依赖。
+轻量多 Registry Docker 代理服务，纯 Python 实现，零依赖。
+
+## 支持的 Registry
+
+| 前缀 | 上游 Registry |
+|------|-------------|
+| 默认 | Docker Hub (registry-1.docker.io) |
+| `ghcr.` | GitHub Container Registry (ghcr.io) |
+| `quay.` | Quay.io |
+| `gcr.` | Google Container Registry (gcr.io) |
+| `k8s-gcr.` | K8s GCR (k8s.gcr.io) |
+| `k8s.` | K8s Registry (registry.k8s.io) |
+| `nvcr.` | NVIDIA Container Registry (nvcr.io) |
+| `cloudsmith.` | Cloudsmith (docker.cloudsmith.io) |
 
 ## 功能
 
-- **Registry API 代理** — 自动为官方镜像添加 `library/` 前缀，无需手动指定
-- **Token 自动换取** — 透明处理 Docker Hub 认证流程
-- **浏览器透传** — 访问首页直接展示 Docker Hub 页面
-- **重定向透传** — blob 下载的 CDN 签名 URL 直接传回客户端
+- **多 Registry 代理** — 一个端口代理所有主流 Registry
+- **官方镜像自动 library/ 前缀** — `docker pull python:3.12` 直接可用
+- **Token 自动换取** — 透明处理认证流程，支持多 Registry 认证服务器
+- **浏览器透传** — 访问首页展示 Docker Hub 页面
+- **DSM/群晖兼容** — `/v1/search` 搜索 API 正确转发
+- **%3A 编码修复** — 兼容各种 Docker 客户端
+- **CORS 预检** — OPTIONS 请求正确响应
 - **零磁碟占用** — 纯代理，不做本地缓存
 - **低内存** — 运行仅占 ~9MB 内存
 
@@ -24,11 +40,9 @@ PORT=8080 python3 server.py
 ## 部署（systemd）
 
 ```bash
-# 复制文件
 mkdir -p /opt/docker-proxy
 cp server.py /opt/docker-proxy/
 
-# 创建 systemd 服务
 cat > /etc/systemd/system/docker-proxy.service << 'EOF'
 [Unit]
 Description=Docker Hub Proxy
@@ -52,7 +66,7 @@ systemctl enable --now docker-proxy
 
 ## 配合 Docker 使用
 
-在需要使用代理的服务器上配置 `/etc/docker/daemon.json`：
+`/etc/docker/daemon.json`：
 
 ```json
 {
@@ -60,17 +74,32 @@ systemctl enable --now docker-proxy
 }
 ```
 
-重启 Docker 后即可直接拉取：
+重启 Docker 后直接拉取：
 
 ```bash
-docker pull python:alpine3.23        # 自动走代理
-docker pull nginx:latest             # 自动走代理
-docker pull your-namespace/repo:tag  # 第三方镜像也支持
+# Docker Hub 官方镜像
+docker pull python:alpine3.23
+docker pull nginx:latest
+
+# Docker Hub 用户镜像
+docker pull cloudflare/cloudflared:latest
+
+# GitHub Container Registry
+docker pull ghcr.io/owner/repo:tag
+```
+
+## 高级用法
+
+通过 `ns=` 参数动态指定 Registry（不依赖子域名）：
+
+```bash
+# 通过 ns 参数访问 GHCR
+curl https://your-domain.com/v2/owner/repo/manifests/latest?ns=ghcr.io
 ```
 
 ## 反向代理
 
-建议使用 nginx/Caddy 反代并配置 HTTPS：
+nginx 配置：
 
 ```nginx
 server {
@@ -92,10 +121,14 @@ server {
 ## 工作原理
 
 ```
-客户端请求                    代理服务
-  │                            │
-  ├─ /v2/                      → 返回 registry 2.0 handshake
-  ├─ /v2/python/manifests/...  → 补 library/ + 换 token → registry-1.docker.io
-  ├─ /v2/nginx/blobs/...       → 换 token → 重定向透传到 CDN
-  └─ / (浏览器)                → 透传 hub.docker.com
+客户端请求                      代理服务
+  │                              │
+  ├─ /v2/                        → registry 2.0 handshake
+  ├─ /v2/python/manifests/...    → 补 library/ + 换 token → Docker Hub
+  ├─ /v2/ghcr/owner/repo/...     → 转发 ghcr.io + 换 GHCR token
+  ├─ /v2/nginx/blobs/...         → 换 token → 重定向透传 CDN
+  ├─ /v1/search?q=nginx          → index.docker.io 搜索 API
+  ├─ /token                      → auth.docker.io 认证
+  ├─ / (浏览器)                  → 透传 hub.docker.com
+  └─ OPTIONS                     → CORS 预检 204
 ```
