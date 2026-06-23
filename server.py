@@ -222,6 +222,12 @@ Commercial support is available at
 </html>"""
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Don't follow redirects - return them to the client."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def get_token(repo, auth_url=AUTH_URL, service='registry.docker.io'):
     """Get a pull token for the given repo, with caching. Uses accounts if available."""
     cache_key = (auth_url, repo)
@@ -832,14 +838,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             req = urllib.request.Request(upstream_url, headers=fwd_headers)
             ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-                # Follow CDN redirects for blob downloads (server-side)
-                if resp.status in (301, 302, 307, 308) and resp.headers.get('Location'):
-                    self._follow_cdn(resp.headers['Location'])
-                    return
-
+            # Don't follow redirects - CDN blob URLs are IP-signed
+            # and must be fetched directly by the client
+            opener = urllib.request.build_opener(NoRedirectHandler())
+            with opener.open(req, timeout=30) as resp:
                 body = resp.read()
                 resp_headers = dict(resp.getheaders())
+
+                # Pass redirects back to client (CDN URLs are IP-signed)
+                if resp.status in (301, 302, 307, 308) and 'location' in resp_headers:
+                    resp_headers['Docker-Distribution-API-Version'] = 'registry/2.0'
+                    self.send_response(resp.status)
+                    for k, v in resp_headers.items():
+                        if k.lower() not in ('connection',):
+                            self.send_header(k, v)
+                    for k, v in CORS_HEADERS.items():
+                        self.send_header(k, v)
+                    self.end_headers()
+                    stats_increment('success_count')
+                    return
 
                 if 'Www-Authenticate' in resp_headers:
                     resp_headers['Www-Authenticate'] = self._rewrite_auth(
@@ -864,9 +881,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             body = e.read()
             resp_headers = dict(e.headers)
 
-            # Follow CDN redirects for blob downloads
+            # Pass redirects back to client
             if e.code in (301, 302, 307, 308) and resp_headers.get('Location'):
-                self._follow_cdn(resp_headers['Location'])
+                resp_headers['Docker-Distribution-API-Version'] = 'registry/2.0'
+                self.send_response(e.code)
+                for k, v in resp_headers.items():
+                    if k.lower() not in ('connection', 'transfer-encoding'):
+                        self.send_header(k, v)
+                for k, v in CORS_HEADERS.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                stats_increment('error_count')
                 return
 
             if 'Www-Authenticate' in resp_headers:
