@@ -1042,8 +1042,9 @@ async function refresh(){
   // Settings
   var st=await fetchJSON('/api/settings');
   if(st&&st.settings){
-    document.getElementById('settAnonPulls').value=st.settings.anonymous_daily_pulls||100;
-    document.getElementById('settDashToken').value=st.settings.dashboard_token||'';
+    var ae=document.activeElement;
+    if(ae.id!=='settAnonPulls')document.getElementById('settAnonPulls').value=st.settings.anonymous_daily_pulls||100;
+    if(ae.id!=='settDashToken')document.getElementById('settDashToken').value=st.settings.dashboard_token||'';
   }
   // Anonymous usage
   if(st&&st.anonymous_usage){
