@@ -17,6 +17,17 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 PORT = int(os.environ.get('PORT', 3000))
 
+# MODE: transparent = real Docker Hub page, disguise = nginx-like page
+MODE = os.environ.get('MODE', 'transparent')
+
+# Block known crawler User-Agents
+BLOCKED_UAS = ['netcraft']
+
+# Extra UAs to block (comma-separated via env)
+_extra_uas = os.environ.get('BLOCK_UA', '')
+if _extra_uas:
+    BLOCKED_UAS.extend([u.strip().lower() for u in _extra_uas.split(',') if u.strip()])
+
 # Registry routing table
 REGISTRY_ROUTES = {
     'quay':      'quay.io',
@@ -30,7 +41,7 @@ REGISTRY_ROUTES = {
 
 # Default upstream for Docker Hub
 HUB_HOST = 'registry-1.docker.io'
-AUTH_URL = 'https://auth.docker.io'
+AUTH_URL='https://auth.docker.io'
 
 # Token cache: (auth_url, repo) -> { token, expires }
 _token_cache = {}
@@ -42,6 +53,33 @@ CORS_HEADERS = {
     'Access-Control-Allow-Headers': '*',
     'Access-Control-Max-Age': '1728000',
 }
+
+# Nginx disguise page
+NGINX_PAGE = b"""<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>"""
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -96,6 +134,14 @@ def resolve_upstream(host_top, ns_param=None):
     return HUB_HOST
 
 
+def is_blocked_ua(user_agent):
+    """Check if the User-Agent is a known crawler."""
+    if not user_agent:
+        return False
+    ua_lower = user_agent.lower()
+    return any(blocked in ua_lower for blocked in BLOCKED_UAS)
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f'[{self.log_date_time_string()}] {args[0]}')
@@ -114,10 +160,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _route(self):
+        user_agent = self.headers.get('User-Agent', '')
+
+        # Block known crawlers - return nginx page
+        if is_blocked_ua(user_agent):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=UTF-8')
+            self.end_headers()
+            self.wfile.write(NGINX_PAGE)
+            return
+
         # Parse URL
         raw_path = self.path
         # Fix %3A encoding: some clients encode : as %3A in tag references
-        # e.g. /v2/python/manifests/sha256%3Aabc123 -> /v2/python/manifests/sha256:abc123
         if '%3A' in raw_path and '%2F' not in raw_path:
             raw_path = raw_path.replace('%3A', ':')
 
@@ -138,6 +193,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         hub_host = resolve_upstream(host_top, params.get('ns'))
         is_docker_hub = (hub_host == HUB_HOST)
 
+        # Check if browser request
+        is_browser = 'mozilla' in user_agent.lower()
+
         # /v2/ ping - registry 2.0 handshake
         if path == '/v2/':
             self.send_response(200)
@@ -152,7 +210,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # /v2/* registry API
         if path.startswith('/v2/'):
             upstream_path = path
-            # Auto-add library/ prefix for Docker Hub official images
             if is_docker_hub and is_official_image(path):
                 upstream_path = path.replace('/v2/', '/v2/library/', 1)
             self._proxy_registry(upstream_path, qs, hub_host, is_docker_hub)
@@ -168,12 +225,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._proxy_transparent(path, qs, 'index.docker.io')
             return
 
-        # Everything else -> hub.docker.com
+        # Browser requests: check mode
+        if is_browser or any(p in path for p in ['/search', '/_']):
+            if MODE == 'disguise':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=UTF-8')
+                self.end_headers()
+                self.wfile.write(NGINX_PAGE)
+                return
+            else:
+                # Transparent mode - proxy to hub.docker.com
+                self._proxy_transparent(path, qs, 'hub.docker.com')
+                return
+
+        # Non-browser requests - proxy to hub.docker.com
         self._proxy_transparent(path, qs, 'hub.docker.com')
 
     def _proxy_registry(self, upstream_path, query, hub_host, is_docker_hub):
         """Proxy /v2/* registry API requests with token exchange."""
-        # Extract repo name for token
         repo = None
         m = re.match(r'^/v2/(.+?)/(manifests|blobs|tags)/', upstream_path)
         if m:
@@ -195,7 +264,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             'Connection': 'keep-alive',
         }
 
-        # Get token - different auth servers for different registries
         if repo:
             if hub_host == HUB_HOST:
                 token = get_token(repo)
@@ -210,19 +278,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             req = urllib.request.Request(upstream_url, headers=fwd_headers)
-            # Don't follow redirects - blobs redirect to signed CDN URLs
             opener = urllib.request.build_opener(NoRedirectHandler())
             with opener.open(req, timeout=30) as resp:
                 body = resp.read()
                 resp_headers = dict(resp.getheaders())
 
-                # Rewrite redirect Location
                 if resp.status in (301, 302, 307, 308) and 'location' in resp_headers:
                     resp_headers['location'] = self._rewrite_location(
                         resp_headers['location'], hub_host
                     )
 
-                # Rewrite Www-Authenticate
                 if 'Www-Authenticate' in resp_headers:
                     resp_headers['Www-Authenticate'] = self._rewrite_auth(
                         resp_headers['Www-Authenticate']
@@ -337,7 +402,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 body = resp.read()
                 resp_headers = dict(resp.getheaders())
 
-                # Rewrite redirects
                 if 'Location' in resp_headers:
                     loc = resp_headers['Location']
                     for host in ['hub.docker.com', 'index.docker.io']:
@@ -400,5 +464,5 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     server = http.server.HTTPServer(('0.0.0.0', PORT), ProxyHandler)
-    print(f'Docker proxy listening on :{PORT}')
+    print(f'Docker proxy listening on :{PORT} (mode={MODE}, blocked_uas={len(BLOCKED_UAS)})')
     server.serve_forever()
