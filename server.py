@@ -31,6 +31,9 @@ _extra_uas = os.environ.get('BLOCK_UA', '')
 if _extra_uas:
     BLOCKED_UAS.extend([u.strip().lower() for u in _extra_uas.split(',') if u.strip()])
 
+# Dashboard auth token (set via env to protect dashboard/API)
+DASHBOARD_TOKEN = os.environ.get('DASHBOARD_TOKEN', '')
+
 # Registry routing table
 REGISTRY_ROUTES = {
     'quay':      'quay.io',
@@ -307,6 +310,40 @@ def is_blocked_ua(user_agent):
 
 
 # ============================================================
+# Login page HTML (shown when DASHBOARD_TOKEN is set)
+# ============================================================
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Docker Proxy Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;width:360px;text-align:center}
+h1{font-size:1.4em;margin-bottom:8px}
+p{color:#8b949e;font-size:.9em;margin-bottom:24px}
+input{width:100%;padding:12px 16px;border:1px solid #30363d;border-radius:8px;background:#0d1117;color:#e6edf3;font-size:1em;margin-bottom:16px;outline:none}
+input:focus{border-color:#58a6ff}
+button{width:100%;padding:12px;background:#238636;color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;font-weight:600}
+button:hover{background:#2ea043}
+.err{color:#f85149;font-size:.85em;margin-top:12px;display:none}
+</style></head><body>
+<div class="login-box">
+<h1>🚢 Docker Proxy</h1>
+<p>輸入存取令牌以繼續</p>
+<form id="f"><input id="token" type="password" placeholder="Access Token" autofocus>
+<button type="submit">登入</button></form>
+<div class="err" id="err">令牌無效</div>
+</div>
+<script>
+document.getElementById('f').onsubmit=function(e){
+e.preventDefault();
+var t=document.getElementById('token').value;
+if(t){window.location.href='/dashboard?token='+encodeURIComponent(t)}
+else{document.getElementById('err').style.display='block'}
+};
+</script></body></html>"""
+
+# ============================================================
 # Dashboard HTML (embedded, dark theme, no external deps)
 # ============================================================
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -430,7 +467,14 @@ function memFmt(b){
   if(b>1048576)return(b/1048576).toFixed(1)+' MB';
   return(b/1024).toFixed(0)+' KB';
 }
-async function fetchJSON(url){try{var r=await fetch(url);return await r.json()}catch(e){return null}}
+async function fetchJSON(url){
+try{
+var tk=new URLSearchParams(window.location.search).get('token')||'';
+var sep=url.includes('?')?'&':'?';
+var r=await fetch(tk?url+sep+'token='+encodeURIComponent(tk):url);
+if(r.status===401){document.body.innerHTML='<h1 style="color:#f85149;text-align:center;margin-top:40vh">Session expired</h1>';return null}
+return await r.json()
+}catch(e){return null}}
 async function refresh(){
   var s=await fetchJSON('/api/status');
   if(s){
@@ -565,16 +609,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     k, v = part.split('=', 1)
                     params[k] = unquote(v)
 
-        # ---- Dashboard and API routes (new) ----
+        # ---- Dashboard and API routes (auth-protected) ----
 
         # /dashboard - serve embedded HTML dashboard
         if path == '/dashboard':
+            if not self._check_dashboard_auth():
+                return
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=UTF-8')
+            if hasattr(self, '_pending_cookie') and self._pending_cookie:
+                self.send_header('Set-Cookie', self._pending_cookie)
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode())
             stats_increment('success_count')
             return
+
+        # /api/* - all dashboard API endpoints require auth
+        if path.startswith('/api/'):
+            if not self._check_dashboard_auth():
+                return
 
         # /api/status - proxy status and stats
         if path == '/api/status':
@@ -1034,11 +1087,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         auth = auth.replace('https://quay.io/v2/auth', f'http://{host}/token')
         return auth
 
+    def _check_dashboard_auth(self):
+        """Check dashboard auth via cookie or query param. Returns True if allowed."""
+        # If no token configured, allow all access
+        if not DASHBOARD_TOKEN:
+            return True
+
+        # Check cookie
+        cookie = self.headers.get('Cookie', '')
+        if f'dashboard_token={DASHBOARD_TOKEN}' in cookie:
+            return True
+
+        # Check query param ?token=xxx
+        if '?' in self.path:
+            for part in self.path.split('?', 1)[1].split('&'):
+                if part.startswith('token=') and part[6:] == DASHBOARD_TOKEN:
+                    # Authenticated - set cookie for future requests
+                    self._pending_cookie = f'dashboard_token={DASHBOARD_TOKEN}; Path=/; HttpOnly; Max-Age=86400'
+                    return True
+
+        # Auth required - show login page
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=UTF-8')
+        self.end_headers()
+        self.wfile.write(LOGIN_HTML.encode())
+        return False
+
     def _respond_json(self, status, data):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
+        if hasattr(self, '_pending_cookie') and self._pending_cookie:
+            self.send_header('Set-Cookie', self._pending_cookie)
         for k, v in CORS_HEADERS.items():
             self.send_header(k, v)
         self.end_headers()
