@@ -849,17 +849,17 @@ background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center
 <div class="tab-content" id="tab-settings">
 <div class="section">
   <h2><span>&#9881;</span> Proxy Settings</h2>
-  <div style=\"max-width:500px\">
-    <div class=\"form-row\">
-      <label style=\"flex:0 0 200px;color:var(--text-dim);line-height:36px\">Anonymous Daily Pulls</label>
-      <input type=\"number\" id=\"settAnonPulls\" min=\"0\" placeholder=\"100\">
+  <div style="max-width:500px">
+    <div class="form-row">
+      <label style="flex:0 0 200px;color:var(--text-dim);line-height:36px">Anonymous Daily Pulls</label>
+      <input type="number" id="settAnonPulls" min="0" placeholder="100">
     </div>
-    <div class=\"form-row\">
-      <label style=\"flex:0 0 200px;color:var(--text-dim);line-height:36px\">Dashboard Token</label>
-      <input type=\"text\" id=\"settDashToken\" placeholder=\"留空則無需認證\">
+    <div class="form-row">
+      <label style="flex:0 0 200px;color:var(--text-dim);line-height:36px">Dashboard Token</label>
+      <input type="text" id="settDashToken" placeholder="留空則無需認證">
     </div>
-    <div class=\"form-row\">
-      <button class=\"btn primary\" onclick=\"saveSettings()\">Save Settings</button>
+    <div class="form-row">
+      <button class="btn primary" onclick="saveSettings()">Save Settings</button>
     </div>
     <div id="settingsMsg" class="msg"></div>
   </div>
