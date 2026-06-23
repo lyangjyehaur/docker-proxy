@@ -207,6 +207,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{}')
             return
 
+        # /v2/search/* -> hub.docker.com (DSM search API, not registry)
+        if path.startswith('/v2/search/'):
+            self._proxy_transparent(path, qs, 'hub.docker.com')
+            return
+
         # /v2/* registry API
         if path.startswith('/v2/'):
             upstream_path = path
