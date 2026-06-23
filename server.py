@@ -34,7 +34,7 @@ _extra_uas = os.environ.get('BLOCK_UA', '')
 if _extra_uas:
     BLOCKED_UAS.extend([u.strip().lower() for u in _extra_uas.split(',') if u.strip()])
 
-# Dashboard auth token (set via env to protect dashboard/API)
+# Dashboard auth token (env var is fallback, settings file takes priority)
 DASHBOARD_TOKEN = os.environ.get('DASHBOARD_TOKEN', '')
 
 # Registry routing table
@@ -106,6 +106,7 @@ _settings_lock = threading.Lock()
 
 DEFAULT_SETTINGS = {
     'anonymous_daily_pulls': 100,
+    'dashboard_token': os.environ.get('DASHBOARD_TOKEN', ''),
 }
 
 def _load_settings():
@@ -848,13 +849,17 @@ background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center
 <div class="tab-content" id="tab-settings">
 <div class="section">
   <h2><span>&#9881;</span> Proxy Settings</h2>
-  <div style="max-width:500px">
-    <div class="form-row">
-      <label style="flex:0 0 200px;color:var(--text-dim);line-height:36px">Anonymous Daily Pulls</label>
-      <input type="number" id="settAnonPulls" min="0" placeholder="100">
+  <div style=\"max-width:500px\">
+    <div class=\"form-row\">
+      <label style=\"flex:0 0 200px;color:var(--text-dim);line-height:36px\">Anonymous Daily Pulls</label>
+      <input type=\"number\" id=\"settAnonPulls\" min=\"0\" placeholder=\"100\">
     </div>
-    <div class="form-row">
-      <button class="btn primary" onclick="saveSettings()">Save Settings</button>
+    <div class=\"form-row\">
+      <label style=\"flex:0 0 200px;color:var(--text-dim);line-height:36px\">Dashboard Token</label>
+      <input type=\"text\" id=\"settDashToken\" placeholder=\"留空則無需認證\">
+    </div>
+    <div class=\"form-row\">
+      <button class=\"btn primary\" onclick=\"saveSettings()\">Save Settings</button>
     </div>
     <div id="settingsMsg" class="msg"></div>
   </div>
@@ -1038,6 +1043,7 @@ async function refresh(){
   var st=await fetchJSON('/api/settings');
   if(st&&st.settings){
     document.getElementById('settAnonPulls').value=st.settings.anonymous_daily_pulls||100;
+    document.getElementById('settDashToken').value=st.settings.dashboard_token||'';
   }
   // Anonymous usage
   if(st&&st.anonymous_usage){
@@ -1158,8 +1164,11 @@ async function saveEditUser(){
 // Settings
 async function saveSettings(){
   var ap=parseInt(document.getElementById('settAnonPulls').value);
+  var dt=document.getElementById('settDashToken').value;
   var msg=document.getElementById('settingsMsg');
-  var d=await apiCall('/api/settings','PUT',{anonymous_daily_pulls:ap});
+  var payload={anonymous_daily_pulls:ap};
+  if(dt!==null)payload.dashboard_token=dt;
+  var d=await apiCall('/api/settings','PUT',payload);
   if(d.settings){msg.className='msg ok';msg.textContent='Settings saved!';}
   else{msg.className='msg err';msg.textContent=d.error||'Failed to save.';}
 }
@@ -1607,11 +1616,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             patch['anonymous_daily_pulls'] = v
                     except (ValueError, TypeError):
                         pass
+                if 'dashboard_token' in data:
+                    patch['dashboard_token'] = str(data['dashboard_token']).strip()
                 if not patch:
                     self._respond_json(400, {'error': 'No valid settings to update'})
                     return
                 settings = update_settings(patch)
-                add_log('INFO', f'Settings updated: {patch}')
+                add_log('INFO', f'Settings updated: {list(patch.keys())}')
                 self._respond_json(200, {'ok': True, 'settings': settings})
             except json.JSONDecodeError:
                 self._respond_json(400, {'error': 'Invalid JSON'})
@@ -2026,21 +2037,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _check_dashboard_auth(self):
         """Check dashboard auth via cookie or query param. Returns True if allowed."""
-        # If no token configured, allow all access
-        if not DASHBOARD_TOKEN:
+        # Get current token (settings file takes priority over env var)
+        settings = get_settings()
+        token = settings.get('dashboard_token', '') or DASHBOARD_TOKEN
+        if not token:
             return True
 
         # Check cookie
         cookie = self.headers.get('Cookie', '')
-        if f'dashboard_token={DASHBOARD_TOKEN}' in cookie:
+        if f'dashboard_token={token}' in cookie:
             return True
 
         # Check query param ?token=xxx
         if '?' in self.path:
             for part in self.path.split('?', 1)[1].split('&'):
-                if part.startswith('token=') and part[6:] == DASHBOARD_TOKEN:
-                    # Authenticated - set cookie for future requests
-                    self._pending_cookie = f'dashboard_token={DASHBOARD_TOKEN}; Path=/; HttpOnly; Max-Age=86400'
+                if part.startswith('token=') and part[6:] == token:
+                    self._pending_cookie = f'dashboard_token={token}; Path=/; HttpOnly; Max-Age=86400'
                     return True
 
         # Auth required - show login page
