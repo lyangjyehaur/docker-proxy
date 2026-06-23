@@ -226,7 +226,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # /v1/* search API -> index.docker.io
+        # DSM adds library/ prefix to search queries, strip it
         if path.startswith('/v1/'):
+            if 'library/' in qs and 'q=library/' in qs:
+                qs = qs.replace('q=library/', 'q=', 1)
             self._proxy_transparent(path, qs, 'index.docker.io')
             return
 
