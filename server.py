@@ -1757,9 +1757,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     stats_increment('success_count')
                     return
 
-                if 'Www-Authenticate' in resp_headers:
-                    resp_headers['Www-Authenticate'] = self._rewrite_auth(
-                        resp_headers['Www-Authenticate']
+                # Case-insensitive check for Www-Authenticate
+                auth_key = None
+                for k in resp_headers:
+                    if k.lower() == 'www-authenticate':
+                        auth_key = k
+                        break
+                if auth_key:
+                    resp_headers[auth_key] = self._rewrite_auth(
+                        resp_headers[auth_key]
                     )
 
                 resp_headers['Docker-Distribution-API-Version'] = 'registry/2.0'
@@ -1793,9 +1799,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 stats_increment('error_count')
                 return
 
-            if 'Www-Authenticate' in resp_headers:
-                resp_headers['Www-Authenticate'] = self._rewrite_auth(
-                    resp_headers['Www-Authenticate']
+            # Case-insensitive check for Www-Authenticate
+            auth_key = None
+            for k in resp_headers:
+                if k.lower() == 'www-authenticate':
+                    auth_key = k
+                    break
+            if auth_key:
+                resp_headers[auth_key] = self._rewrite_auth(
+                    resp_headers[auth_key]
                 )
             resp_headers['Docker-Distribution-API-Version'] = 'registry/2.0'
 
@@ -2007,9 +2019,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _rewrite_auth(self, auth):
         """Rewrite Www-Authenticate header to point to this proxy."""
         host = self.headers.get('Host', f'localhost:{PORT}')
-        auth = auth.replace(AUTH_URL, f'http://{host}')
-        auth = auth.replace('https://ghcr.io/token', f'http://{host}/token')
-        auth = auth.replace('https://quay.io/v2/auth', f'http://{host}/token')
+        # Use https if behind Cloudflare/proxy, http for direct access
+        scheme = 'https' if self.headers.get('X-Forwarded-Proto') == 'https' or '443' in str(self.headers.get('Host', '')) else 'http'
+        auth = auth.replace(AUTH_URL, f'{scheme}://{host}')
+        auth = auth.replace('https://ghcr.io/token', f'{scheme}://{host}/token')
+        auth = auth.replace('https://quay.io/v2/auth', f'{scheme}://{host}/token')
         return auth
 
     def _check_dashboard_auth(self):
