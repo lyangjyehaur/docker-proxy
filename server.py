@@ -1373,6 +1373,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._proxy_transparent(path, qs, 'hub.docker.com')
             return
 
+        # /v2/_catalog -> return empty catalog (Docker Hub doesn't support it for free)
+        if path == '/v2/_catalog':
+            self._respond_json(200, {'repositories': []})
+            return
+
         # /v2/* registry API
         if path.startswith('/v2/'):
             # Manifest/tag requests require auth (forces Docker to authenticate)
