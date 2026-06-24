@@ -1339,33 +1339,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             stats_increment('success_count')
             return
 
-        # /v2/ ping - registry 2.0 handshake
-        # Always challenge with 401 if no auth, so Docker sends credentials
+        # /v2/ ping - registry 2.0 handshake (always 200, allow DSM and anonymous)
         if path in ('/v2/', '/v2'):
-            auth_header = self.headers.get('Authorization', '')
-            if auth_header.startswith('Basic '):
-                import base64
-                try:
-                    decoded = base64.b64decode(auth_header[6:]).decode()
-                    username, password = decoded.split(':', 1)
-                    result = authenticate_user(username, password)
-                    if result and isinstance(result, dict):
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'application/json')
-                        self.send_header('Docker-Distribution-API-Version', 'registry/2.0')
-                        for k, v in CORS_HEADERS.items():
-                            self.send_header(k, v)
-                        self.end_headers()
-                        self.wfile.write(b'{}')
-                        stats_increment('success_count')
-                        return
-                except Exception:
-                    pass
-                self._respond_error(401, 'UNAUTHORIZED', 'Invalid credentials', www_authenticate=True)
-                stats_increment('error_count')
-                return
-            self._respond_error(401, 'UNAUTHORIZED', 'authentication required', www_authenticate=True)
-            stats_increment('error_count')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Docker-Distribution-API-Version', 'registry/2.0')
+            for k, v in CORS_HEADERS.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(b'{}')
+            stats_increment('success_count')
             return
 
         # /v2/search/* -> hub.docker.com (DSM search API, not registry)
@@ -1380,19 +1363,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # /v2/* registry API
         if path.startswith('/v2/'):
-            # Manifest/tag requests require auth (forces Docker to authenticate)
+            # Manifest/tag requests: track usage (allow anonymous)
             is_manifest = '/manifests/' in path or '/tags/' in path or path.endswith('/tags/list')
             if is_manifest:
-                auth_header = self.headers.get('Authorization', '')
-                if not auth_header.startswith('Basic '):
-                    # No auth - challenge Docker to authenticate
-                    self._respond_error(401, 'UNAUTHORIZED', 'authentication required', www_authenticate=True)
-                    stats_increment('error_count')
-                    return
-                # Has auth - validate via _check_proxy_auth
                 if not self._check_proxy_auth():
                     return
-            # Blob requests pass through without auth check
+            # All requests pass through to upstream
             upstream_path = path
             if is_docker_hub and is_official_image(path):
                 upstream_path = path.replace('/v2/', '/v2/library/', 1)
