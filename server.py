@@ -1356,19 +1356,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._proxy_transparent(path, qs, 'hub.docker.com')
             return
 
-        # /v2/_catalog -> return empty catalog (Docker Hub doesn't support it for free)
-        if path == '/v2/_catalog':
-            body = json.dumps({'repositories': []}).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', len(body))
-            self.send_header('Docker-Distribution-API-Version', 'registry/2.0')
-            for k, v in CORS_HEADERS.items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
         # /v2/* registry API
         if path.startswith('/v2/'):
             # Manifest/tag requests: track usage (allow anonymous)
